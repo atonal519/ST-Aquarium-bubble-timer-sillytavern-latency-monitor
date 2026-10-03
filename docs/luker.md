@@ -24,7 +24,9 @@ node install.mjs /path/to/Luker
 - 用量仅记录 provider 实际返回的字段。Luker 适配不修改 provider 请求体，不强制加入 `stream_options.include_usage`；上游未返回用量时，token/成本可能为空。
 - 显式 job AbortSignal 用来识别用户停止。瞬时 WS 断开不等同于停止生成。
 - 监控写盘异步完成，不阻塞 Luker 的生成任务收尾。进程在写入前被终止时，最后一条记录可能丢失。
-- 不新增原始消息/回复正文持久化。非流式 JSON 暂存上限 8 MiB，超限不提取正文长度和用量。流式沿用现有 SSE 解析器。
+- 错误诊断保留余额不足、模型不存在、限流等原始描述，以及可用的嵌套 error/code/status，最多 2048 字符；已知请求凭据和常见 Authorization/Bearer、API key、token、密码、URL 凭据字段尽力脱敏。不会保存错误对象的 stack、请求配置或任意 data/body 字段。HTTP 错误体只解析不超过 32 KiB 的结构化 JSON 错误，不保存原始 HTML。
+- 脱敏不保证识别全部自定义秘密格式；上游错误描述也可能回显用户内容，分享或导出记录前仍需检查。本改动不改变原版 SillyTavern 的错误记录行为。
+- 不新增原始消息/回复正文的专门持久化字段。非流式 JSON 暂存上限 8 MiB，超限不提取正文长度和用量。流式沿用现有 SSE 解析器。
 - 存储仍沿用鱼缸的 `data/default-user/latency-monitor/`，本改动没有实现多用户存储隔离。仅用于已接受该存储模型的部署。
 - 精简版响应在异步初始化前立即克隆，避免初始化较慢时原响应已被读取。耗时仍是浏览器侧观测，初始化延迟可能影响响应阶段时间，不等于服务端精确分段。
 

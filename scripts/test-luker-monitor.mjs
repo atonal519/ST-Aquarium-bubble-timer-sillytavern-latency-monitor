@@ -70,7 +70,7 @@ test('nonstream assembles split UTF-8 JSON before capturing metadata', async () 
     assert.equal(h.finalized, 1);
 });
 
-test('upstream error and emitted terminal failure finalize without storing error payload', async () => {
+test('upstream error and emitted terminal failure preserve useful diagnosis', async () => {
     const h = harness();
     await h.wrap(async ctx => {
         ctx.emit.head({ status: 429 });
@@ -78,7 +78,7 @@ test('upstream error and emitted terminal failure finalize without storing error
     })(h.ctx);
     assert.equal(h.run.http_status, 429);
     assert.equal(h.run.outcome, 'exception');
-    assert.doesNotMatch(h.run.error, /secret/);
+    assert.match(h.run.error, /secret prompt and api key/); // Ordinary diagnostics are intentionally preserved.
     assert.equal(h.finalized, 1);
 });
 
@@ -114,7 +114,7 @@ test('pending telemetry write does not hold the runner open', async () => {
     assert.equal(await h.wrap(async () => 'completed')(h.ctx), 'completed');
 });
 
-test('real monitor records SSE usage once without response body or secret error details', async () => {
+test('real monitor records SSE usage without response body and preserves abort diagnosis', async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -164,7 +164,7 @@ test('real monitor records SSE usage once without response body or secret error 
             assert.equal(runs.length, 2);
             assert.equal(runs[1].client_stopped, true);
             assert.equal(runs[1].abnormal_detail.abnormal_type, 'client_stopped');
-            assert.doesNotMatch(text, /PRIVATE_ERROR/);
+            assert.match(runs[1].error, /PRIVATE_ERROR/); // Preserve useful cancellation detail.
 
         `], { cwd: root, stdio: 'pipe' });
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -179,7 +179,7 @@ test('metadata GET is preprocessing and emitted timeout keeps its category', asy
         assert.ok(h.calls.includes('upstream_request_started'));
         ctx.emit.error(Object.assign(new Error('PRIVATE_TIMEOUT'), { code: 'ETIMEDOUT' }));
     })(h.ctx);
-    assert.equal(h.run.error, 'Luker generation timeout');
+    assert.match(h.run.error, /Luker generation timeout/);
 });
 
 test('oversized JSON retains byte count without claiming empty output', async () => {
@@ -188,4 +188,79 @@ test('oversized JSON retains byte count without claiming empty output', async ()
     assert.equal(h.run.output_chars, null);
     assert.equal(h.run.output_bytes, 8 * 1024 * 1024 + 1);
     assert.equal(h.run.payload, undefined);
+});
+
+for (const [label, error] of [
+    ['insufficient balance', new Error('Insufficient balance: please top up your account')],
+    ['model not found', { error: { message: 'Model example-model does not exist', code: 'model_not_found' } }],
+    ['rate limit', Object.assign(new Error('Rate limit reached; retry after 30 seconds'), { status: 429 })],
+]) {
+    test(`preserves emitted and thrown ${label} diagnostics`, async () => {
+        for (const throws of [false, true]) {
+            const h = harness();
+            const promise = h.wrap(async ctx => { if (throws) throw error; ctx.emit.error(error); })(h.ctx);
+            if (throws) await assert.rejects(promise, value => value === error);
+            else await promise;
+            assert.match(h.run.error, /Insufficient balance|model_not_found|Rate limit/);
+            assert.equal(h.run.outcome, 'exception');
+        }
+    });
+}
+
+test('redacts known outgoing credentials and common nested/header/query secrets', async () => {
+    const h = harness();
+    await h.wrap(async ctx => {
+        await ctx.fetch('/upstream', { method: 'POST', headers: new Headers({ 'x-api-key': 'FAKE_KNOWN_CREDENTIAL' }) });
+        ctx.emit.error(new Error('Insufficient balance: FAKE_KNOWN_CREDENTIAL; Authorization: Bearer FAKE_BEARER; URL https://host/path?api_key=FAKE_QUERY&model=visible', {
+            cause: { error: { message: 'model unavailable', token: 'not selected' }, message: '{"password":"FAKE_PASSWORD", "access_token":"FAKE_ACCESS"}' },
+        }));
+    })(h.ctx);
+    assert.match(h.run.error, /Insufficient balance/);
+    assert.match(h.run.error, /model unavailable/);
+    assert.match(h.run.error, /model=visible/);
+    assert.doesNotMatch(h.run.error, /FAKE_KNOWN|FAKE_BEARER|FAKE_QUERY|FAKE_PASSWORD|FAKE_ACCESS/);
+});
+
+test('HTTP error JSON preserves status and structured diagnosis without arbitrary body fields', async () => {
+    for (const stream of [false, true]) {
+        const h = harness(stream);
+        await h.wrap(async ctx => {
+            ctx.emit.head({ status: 429 });
+            ctx.emit.chunk(JSON.stringify({ error: { message: 'Rate limit: api_key=FAKE_HTTP_KEY', code: 'rate_limit_exceeded' }, request: { prompt: 'DO_NOT_CAPTURE' } }));
+            ctx.emit.end();
+        })(h.ctx);
+        assert.equal(h.run.http_status, 429);
+        assert.match(h.run.error, /Rate limit/);
+        assert.match(h.run.error, /rate_limit_exceeded/);
+        assert.doesNotMatch(h.run.error, /FAKE_HTTP_KEY|DO_NOT_CAPTURE/);
+    }
+});
+
+test('diagnostics are bounded and circular nested errors are safe', async () => {
+    const h = harness();
+    const error = { message: 'Useful diagnostic '.repeat(1000) };
+    error.cause = error;
+    await h.wrap(async ctx => ctx.emit.error(error))(h.ctx);
+    assert.ok(h.run.error.length <= 2048);
+    assert.match(h.run.error, /Useful diagnostic/);
+});
+
+test('quoted multiline and escaped secrets plus URL credentials are redacted', async () => {
+    const h = harness();
+    await h.wrap(async ctx => {
+        await ctx.fetch('https://host/generate?token=FAKE_URL_CREDENTIAL', { method: 'POST' });
+        ctx.emit.error(new Error('insufficient_balance password="first\nSECOND_SECRET"; token="prefix\\"TAIL_SECRET"; echoed FAKE_URL_CREDENTIAL'));
+    })(h.ctx);
+    assert.match(h.run.error, /insufficient_balance/);
+    assert.doesNotMatch(h.run.error, /SECOND_SECRET|TAIL_SECRET|FAKE_URL_CREDENTIAL/);
+});
+
+test('tuple headers and URL key are remembered when echoed without labels', async () => {
+    const h = harness();
+    await h.wrap(async ctx => {
+        await ctx.fetch('https://host/generate?key=FAKE_GOOGLE_KEY', { method: 'POST', headers: [['X-API-Key', 'FAKE_TUPLE_KEY']] });
+        ctx.emit.error(new Error('invalid credentials FAKE_GOOGLE_KEY and FAKE_TUPLE_KEY'));
+    })(h.ctx);
+    assert.match(h.run.error, /invalid credentials/);
+    assert.doesNotMatch(h.run.error, /FAKE_GOOGLE_KEY|FAKE_TUPLE_KEY/);
 });
