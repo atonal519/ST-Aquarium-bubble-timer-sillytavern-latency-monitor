@@ -141,6 +141,33 @@ export const chatCompletionsPatches = [
     },
 ];
 
+// Luker routes requests through a provider-independent dispatch pipeline. Keep
+// this patch set separate: vanilla's fetch/stream anchors no longer exist there.
+export const lukerChatCompletionsPatches = [
+    {
+        id: 'luker-import',
+        label: '引入 monitorLukerDispatch',
+        impact: 'Luker 调度监控不工作',
+        detect: `import { monitorLukerDispatch } from '../../luker-latency-monitor.js';`,
+        anchor: `import { runLukerDispatch } from '../../luker-dispatch/runner.js';`,
+        build: (anchor) => `${anchor}\nimport { monitorLukerDispatch } from '../../luker-latency-monitor.js';`,
+    },
+    {
+        id: 'luker-dispatch',
+        label: '包装 Luker provider 调度',
+        impact: 'Luker 生成不会产生记录',
+        detect: `select: (b) => monitorLukerDispatch(req, selectChatCompletionDispatch(b)),`,
+        anchor: `select: (b) => selectChatCompletionDispatch(b),`,
+        build: () => `select: (b) => monitorLukerDispatch(req, selectChatCompletionDispatch(b)),`,
+    },
+];
+
+export function getChatCompletionsPatches(source) {
+    // Require the actual dispatcher import, rather than a comment mentioning Luker.
+    const isLuker = /^import\s*\{\s*runLukerDispatch\s*\}\s*from\s*['"]\.\.\/\.\.\/luker-dispatch\/runner\.js['"];?/m.test(source);
+    return isLuker ? lukerChatCompletionsPatches : chatCompletionsPatches;
+}
+
 /**
  * 按内容特征判断每一处补丁在不在。只读字符串，不解析语法，
  * 所以用户自己调整过缩进或改过 monitorableSources 名单也不会误判。
@@ -148,7 +175,7 @@ export const chatCompletionsPatches = [
  */
 export function inspectChatCompletionsPatches(source) {
     const text = typeof source === 'string' ? source : '';
-    const results = chatCompletionsPatches.map((patch) => ({
+    const results = getChatCompletionsPatches(text).map((patch) => ({
         id: patch.id,
         label: patch.label,
         impact: patch.impact,

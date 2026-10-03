@@ -601,7 +601,8 @@ export function createGenerationMonitor(request) {
             run.metrics.nonstream_response_ms = finishedAtMs - phases.upstream_request_started;
         }
 
-        if (isClientAbortError(String(run.error ?? '').toLowerCase())) {
+        // Luker provides an explicit job AbortSignal; keep that authoritative signal.
+        if (!run.client_stopped && isClientAbortError(String(run.error ?? '').toLowerCase())) {
             run.client_stopped = await hasClientStopSignal(run.request_client_generation_id);
         }
 

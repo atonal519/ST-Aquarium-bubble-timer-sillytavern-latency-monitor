@@ -6925,6 +6925,18 @@ function recordLiteGeneration(effectiveInit, responsePromise) {
     // 后面可能要等形态探测，开始时间必须在这里取，否则等待时长会被算进这次生成的耗时。
     const startedAtMs = Date.now();
 
+    // 必须在把响应交回调用方之前克隆。形态探测、动态导入和 IndexedDB 都可能
+    // 等很久，届时原响应已被酒馆锁定/读完（Luker 的 WS 响应同样是原生 Response）。
+    // 立即接住拒绝，避免初始化期间出现 unhandledrejection；不阻塞主生成链路。
+    const capturedResponse = Promise.resolve(responsePromise).then((response) => {
+        try {
+            return { response: response.clone(), error: null, failed: false };
+        } catch (error) {
+            return { response: null, error, failed: true };
+        }
+    }, (error) => ({ response: null, error, failed: true }));
+    let responseConsumed = false;
+
     void (async () => {
         let run = null;
         try {
@@ -6949,9 +6961,13 @@ function recordLiteGeneration(effectiveInit, responsePromise) {
             state.liteActiveRun = run;
 
             try {
-                const response = await responsePromise;
-                recorder.markLiteResponseHeaders(run, response);
-                await recorder.consumeLiteResponse(run, response.clone());
+                const captured = await capturedResponse;
+                if (captured.failed) {
+                    throw captured.error;
+                }
+                recorder.markLiteResponseHeaders(run, captured.response);
+                responseConsumed = true;
+                await recorder.consumeLiteResponse(run, captured.response);
             } catch (error) {
                 recorder.markLiteRunError(run, error);
             }
@@ -6967,6 +6983,14 @@ function recordLiteGeneration(effectiveInit, responsePromise) {
         } catch (error) {
             console.warn(`[${MODULE_NAME}] 本地记录这次生成失败`, error);
         } finally {
+            if (!responseConsumed) {
+                // 探测为完整版或初始化失败时放弃旁路；不要等待 tee 的另一端结束。
+                void capturedResponse.then(({ response }) => {
+                    if (response?.body && !response.body.locked) {
+                        void response.body.cancel().catch(() => {});
+                    }
+                }).catch(() => {});
+            }
             if (run && state.liteActiveRun === run) {
                 state.liteActiveRun = null;
             }

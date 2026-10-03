@@ -15,7 +15,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
-    chatCompletionsPatches as PATCHES,
+    getChatCompletionsPatches,
     chatCompletionsPatchTarget,
 } from './backend-monitor-minimal/shared/chat-completions-patch.js';
 
@@ -67,6 +67,7 @@ const COPY_PLAN = [
     // 零依赖的存储层。不带上它，设置里"还剩 N 条旧记录"的提示永远不会出现。
     { from: 'lite/run-store.js', to: `public/scripts/extensions/third-party/${EXTENSION_DIR_NAME}/lite/run-store.js` },
     { from: 'backend-monitor-minimal/latency-monitor.js', to: 'src/latency-monitor.js' },
+    { from: 'backend-monitor-minimal/luker-latency-monitor.js', to: 'src/luker-latency-monitor.js' },
     { from: 'backend-monitor-minimal/server-plugin/index.js', to: `plugins/${PLUGIN_DIR_NAME}/index.js` },
     { from: 'backend-monitor-minimal/server-plugin/package.json', to: `plugins/${PLUGIN_DIR_NAME}/package.json` },
     // settings-ui 和 shared 各要放两份：latency-monitor.js 在 src/ 下用 './settings-ui/'，
@@ -182,8 +183,8 @@ function placeFiles(stRoot) {
     }
 }
 
-function applyPatches(stRoot) {
-    console.log('\n[2/3] 给本体打补丁');
+function preparePatches(stRoot) {
+    console.log('\n[预检] 检查补丁兼容性');
 
     const target = path.join(stRoot, TARGET_FILE);
     const raw = fs.readFileSync(target, 'utf8');
@@ -194,7 +195,7 @@ function applyPatches(stRoot) {
     let applied = 0;
     let alreadyThere = 0;
 
-    for (const patch of PATCHES) {
+    for (const patch of getChatCompletionsPatches(source)) {
         if (source.includes(patch.detect)) {
             alreadyThere++;
             skip(`${patch.label}（已存在，跳过）`);
@@ -223,21 +224,31 @@ function applyPatches(stRoot) {
 
     if (applied === 0) {
         console.log(`  ${DIM}全部 ${alreadyThere} 处补丁都已存在，本体无需改动${RESET}`);
-        return;
     }
 
-    if (dryRun) {
-        console.log(`  ${DIM}（dry-run，未写入）${RESET}`);
+    // Parse without importing or executing the target. Do this before any file
+    // placement or duplicate removal, including when all patches already exist.
+    try {
+        execFileSync(process.execPath, ['--input-type=module', '--check'], { input: source, stdio: 'pipe' });
+    } catch (error) {
+        die(`补丁预检语法检查失败，未修改任何文件。\n${error.stderr?.toString() ?? error.message}`);
+    }
+    return { target, source: usesCrlf ? source.replace(/\n/g, '\r\n') : source, applied };
+}
+
+function applyPatches({ target, source, applied }) {
+    console.log('\n[2/3] 给本体打补丁');
+    if (!applied || dryRun) {
+        skip(dryRun ? 'dry-run，未写入' : '本体无需改动');
         return;
     }
-
     const backup = target + BACKUP_SUFFIX;
     if (!fs.existsSync(backup)) {
         fs.copyFileSync(target, backup);
         ok(`已备份原文件到 ${path.basename(backup)}`);
     }
 
-    fs.writeFileSync(target, usesCrlf ? source.replace(/\n/g, '\r\n') : source, 'utf8');
+    fs.writeFileSync(target, source, 'utf8');
     verifySyntax(target);
 }
 
@@ -307,6 +318,7 @@ function uninstall(stRoot) {
         `public/scripts/extensions/third-party/${EXTENSION_DIR_NAME}`,
         ...findDuplicateExtensionInstalls(stRoot).map((entry) => `public/scripts/extensions/third-party/${entry}`),
         'src/latency-monitor.js',
+        'src/luker-latency-monitor.js',
         `plugins/${PLUGIN_DIR_NAME}`,
         'src/settings-ui',
         'plugins/settings-ui',
@@ -345,8 +357,15 @@ function main() {
         return;
     }
 
+    // Validate everything we can before removing old installs or copying files.
+    for (const item of COPY_PLAN) {
+        if (!fs.existsSync(path.join(REPO_ROOT, item.from))) {
+            die(`仓库里缺少 ${item.from}，未修改任何文件。`);
+        }
+    }
+    const prepared = preparePatches(stRoot);
     placeFiles(stRoot);
-    applyPatches(stRoot);
+    applyPatches(prepared);
     enableServerPlugins(stRoot);
 
     if (hasFailure) {
